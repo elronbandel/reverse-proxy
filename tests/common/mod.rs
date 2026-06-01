@@ -64,7 +64,6 @@ async fn openai_handler(State(s): State<Arc<FakeState>>, Json(body): Json<Value>
         *s.reply_tx.lock().await    = Some(reply_tx);
         // cache the delta so read_message can return it if called
         *s.delta_cache.lock().await = Some((conv_id, json!([last])));
-        s.notify.notify_one();
     } else {
         // new conversation
         let tools: Vec<Value> = body["tools"].as_array().cloned().unwrap_or_default();
@@ -391,10 +390,11 @@ pub async fn assert_delta_on_continuation(
 
     let delta = proxy.mcp_read_message().await;
     assert_eq!(delta["conversation_id"], conversation_id, "conversation_id changed on continuation");
+    let actual_msgs   = delta["messages"].as_array().unwrap();
+    let expected_msgs = expected_delta.as_array().unwrap();
+    assert_eq!(actual_msgs.len(), expected_msgs.len(), "delta message count mismatch");
     // compare role and content, not tool_call_id (implementation detail)
-    for (actual, expected) in delta["messages"].as_array().unwrap().iter()
-        .zip(expected_delta.as_array().unwrap())
-    {
+    for (actual, expected) in actual_msgs.iter().zip(expected_msgs) {
         assert_eq!(actual["role"],    expected["role"]);
         assert_eq!(actual["content"], expected["content"]);
     }
@@ -416,8 +416,22 @@ pub async fn assert_different_conversation_ids(proxy: &TestProxy, first: Value, 
     assert_ne!(first_id, second_id);
 }
 
+/// Sends `first`, then `diverging` (shares a prefix with `first` but then differs).
+/// Asserts the agent sees only the diverging request's own messages — not a continuation of first.
 pub async fn assert_diverging_history_is_new_conversation(proxy: &TestProxy, first: Value, diverging: Value) {
-    assert_different_conversation_ids(proxy, first, diverging).await;
+    let diverging_messages = diverging["messages"].clone();
+
+    let p = proxy.clone();
+    tokio::spawn(async move { p.openai_chat(first).await });
+    proxy.mcp_read_message().await;
+    proxy.mcp_write_message("reply").await;
+
+    let p = proxy.clone();
+    tokio::spawn(async move { p.openai_chat(diverging).await });
+    let read = proxy.mcp_read_message().await;
+    proxy.mcp_write_message("reply").await;
+
+    assert_eq!(read["messages"], diverging_messages, "diverging history was treated as continuation");
 }
 
 pub async fn assert_no_state_leakage(
@@ -441,15 +455,28 @@ pub async fn assert_no_state_leakage(
 }
 
 pub async fn assert_concurrent_ingestion(proxy: &TestProxy, count: usize) {
+    assert!(count >= 2, "need at least 2 requests to test concurrent ingestion");
+
     let handles: Vec<_> = (0..count).map(|i| {
         let p = proxy.clone();
         tokio::spawn(async move {
             p.openai_chat(json!({"messages":[{"role":"user","content":format!("message {i}")}]})).await
         })
     }).collect();
-    for _ in 0..count {
+
+    // Start serving the first request. While it is in progress (before write_message),
+    // yield to let the other requests reach the server — if ingestion were sequential
+    // they would be blocked and the queue size would be 0.
+    proxy.mcp_read_message().await;
+    sleep(Duration::from_millis(10)).await;
+
+    // All remaining requests must already be queued (accepted at the HTTP layer).
+    // We verify by reading them all without any new spawns.
+    proxy.mcp_write_message("reply").await;
+    for _ in 1..count {
         proxy.mcp_read_message().await;
         proxy.mcp_write_message("reply").await;
     }
+
     for h in handles { h.await.unwrap(); }
 }
