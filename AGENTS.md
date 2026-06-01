@@ -24,6 +24,7 @@ treat its rules as binding: code that violates an active rule must not merge.
 - [`doctrine/queue/RULES.md`](doctrine/queue/RULES.md) — queue ordering, conversation continuity, delta delivery.
 - [`doctrine/proxy/RULES.md`](doctrine/proxy/RULES.md) — end-to-end request flow.
 - [`doctrine/tests/RULES.md`](doctrine/tests/RULES.md) — test structure and coverage requirements.
+- [`doctrine/code/RULES.md`](doctrine/code/RULES.md) — code quality: simplicity, naming, no dead code, test discipline.
 
 ## Working in this repo
 

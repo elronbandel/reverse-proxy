@@ -42,6 +42,7 @@ document are to be interpreted as described in BCP 14, RFC 2119 and RFC 8174.
 | Queue and conversations | [doctrine/queue/RULES.md](queue/RULES.md) |
 | Proxy flow | [doctrine/proxy/RULES.md](proxy/RULES.md) |
 | Tests | [doctrine/tests/RULES.md](tests/RULES.md) |
+| Code quality | [doctrine/code/RULES.md](code/RULES.md) |
 
 ## References
 
@@ -54,3 +55,4 @@ document are to be interpreted as described in BCP 14, RFC 2119 and RFC 8174.
 | Date       | Change            |
 |------------|-------------------|
 | 2026-06-01 | Initial version.  |
+| 2026-06-02 | Added doctrine/code/RULES.md for code quality rules. |
