@@ -149,21 +149,21 @@ async fn new_conversation_gets_different_conversation_id() {
 async fn second_conversation_does_not_contain_messages_from_first() {
     let proxy = TestProxy::start().await;
 
-    let first_message  = json!({ "messages": [{ "role": "user", "content": "Secret message" }] });
-    let second_message = json!({ "messages": [{ "role": "user", "content": "Unrelated message" }] });
-    let expected_second_messages = json!([{ "role": "user", "content": "Unrelated message" }]);
+    let first_input  = json!({ "messages": [{ "role": "user", "content": "Secret message"   }] });
+    let second_input = json!({ "messages": [{ "role": "user", "content": "Unrelated message" }] });
+    let target       = json!([{ "role": "user", "content": "Unrelated message" }]);
 
     let p = proxy.clone();
-    tokio::spawn(async move { p.openai_chat(first_message).await });
+    tokio::spawn(async move { p.openai_chat(first_input).await });
     proxy.mcp_read_message().await;
     proxy.mcp_write_message("reply").await;
 
     let p = proxy.clone();
-    tokio::spawn(async move { p.openai_chat(second_message).await });
+    tokio::spawn(async move { p.openai_chat(second_input).await });
     let second_read = proxy.mcp_read_message().await;
     proxy.mcp_write_message("reply").await;
 
-    assert_eq!(second_read["messages"], expected_second_messages);
+    assert_eq!(second_read["messages"], target);
 }
 
 // ── proxy/RULES.md:3 ──────────────────────────────────────────────────────
