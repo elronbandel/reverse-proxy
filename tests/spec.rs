@@ -143,6 +143,29 @@ async fn new_conversation_gets_different_conversation_id() {
     assert_different_conversation_ids(&proxy, first, second).await;
 }
 
+// ── queue/RULES.md:1, queue/RULES.md:3 ────────────────────────────────────
+
+#[tokio::test]
+async fn second_conversation_does_not_contain_messages_from_first() {
+    let proxy = TestProxy::start().await;
+
+    let first_message  = json!({ "messages": [{ "role": "user", "content": "Secret message" }] });
+    let second_message = json!({ "messages": [{ "role": "user", "content": "Unrelated message" }] });
+    let expected_second_messages = json!([{ "role": "user", "content": "Unrelated message" }]);
+
+    let p = proxy.clone();
+    tokio::spawn(async move { p.openai_chat(first_message).await });
+    proxy.mcp_read_message().await;
+    proxy.mcp_write_message("reply").await;
+
+    let p = proxy.clone();
+    tokio::spawn(async move { p.openai_chat(second_message).await });
+    let second_read = proxy.mcp_read_message().await;
+    proxy.mcp_write_message("reply").await;
+
+    assert_eq!(second_read["messages"], expected_second_messages);
+}
+
 // ── proxy/RULES.md:3 ──────────────────────────────────────────────────────
 
 #[tokio::test]
