@@ -29,7 +29,7 @@ impl TestProxy {
     }
 
     pub async fn mcp_list_tools(&self) -> Vec<String> {
-        let result = self.mcp_rpc("tools/list", json!({})).await;
+        let result = self.mcp_call("tools/list", json!({})).await;
         result["tools"]
             .as_array()
             .unwrap()
@@ -38,18 +38,29 @@ impl TestProxy {
             .collect()
     }
 
+    pub async fn mcp_get_tool_definition(&self, name: &str) -> Value {
+        let result = self.mcp_call("tools/list", json!({})).await;
+        result["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == name)
+            .expect("tool not found")
+            .clone()
+    }
+
     pub async fn mcp_read_message(&self) -> Value {
-        let result = self.mcp_rpc("tools/call", json!({"name":"read_message","arguments":{}})).await;
+        let result = self.mcp_call("tools/call", json!({"name":"read_message","arguments":{}})).await;
         let text = result["content"][0]["text"].as_str().unwrap();
         serde_json::from_str(text).unwrap()
     }
 
     pub async fn mcp_write_message(&self, content: &str) {
-        self.mcp_rpc("tools/call", json!({"name":"write_message","arguments":{"content":content}})).await;
+        self.mcp_call("tools/call", json!({"name":"write_message","arguments":{"content":content}})).await;
     }
 
     pub async fn mcp_call_tool(&self, name: &str, arguments: Value) -> String {
-        let result = self.mcp_rpc("tools/call", json!({"name":name,"arguments":arguments})).await;
+        let result = self.mcp_call("tools/call", json!({"name":name,"arguments":arguments})).await;
         result["content"][0]["text"].as_str().unwrap().to_string()
     }
 
@@ -57,7 +68,7 @@ impl TestProxy {
         todo!("subscribe to MCP SSE notification stream")
     }
 
-    pub async fn mcp_rpc(&self, method: &str, params: Value) -> Value {
+    async fn mcp_call(&self, method: &str, params: Value) -> Value {
         let body: Value = self
             .client
             .post(format!("{}/mcp", self.mcp_url))
@@ -72,109 +83,20 @@ impl TestProxy {
     }
 }
 
+// ── Shared utility ─────────────────────────────────────────────────────────
+
+/// Append an assistant tool_call message and the corresponding tool result to `history`.
+fn with_tool_result(history: &[Value], tool_call_response: &Value, tool_return: &str) -> Vec<Value> {
+    let tc = &tool_call_response["choices"][0]["message"]["tool_calls"][0];
+    let mut next = history.to_vec();
+    next.push(tool_call_response["choices"][0]["message"].clone());
+    next.push(json!({"role":"tool","content":tool_return,"tool_call_id":tc["id"]}));
+    next
+}
+
 // ── Assertion helpers ──────────────────────────────────────────────────────
 
-/// Send `input`, assert `tools/list` exposes `expected_tool` with the given schema.
-pub async fn assert_dynamic_tool_schema(proxy: &TestProxy, input: Value, tool_name: &str, target: Value) {
-    let p = proxy.clone();
-    tokio::spawn(async move { p.openai_chat(input).await });
-    sleep(Duration::from_millis(10)).await;
-
-    let result = proxy.mcp_rpc("tools/list", json!({})).await;
-    let tool = result["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|t| t["name"] == tool_name)
-        .expect("tool not found in list");
-
-    assert_eq!(*tool, target);
-    proxy.mcp_write_message("done").await;
-}
-
-/// Two tool calls in one turn: agent calls `first_tool` then `second_tool`, then writes `target`.
-pub async fn assert_two_tool_calls_in_one_turn(
-    proxy: &TestProxy,
-    input: Value,
-    first_tool: &str,
-    first_return: &str,
-    second_tool: &str,
-    second_return: &str,
-    target: &str,
-) {
-    let messages = input["messages"].clone();
-    let p = proxy.clone();
-    let first_task = tokio::spawn(async move { p.openai_chat(input).await });
-
-    proxy.mcp_read_message().await;
-
-    // First tool call
-    let p = proxy.clone();
-    let name = first_tool.to_string();
-    let first_tool_task = tokio::spawn(async move { p.mcp_call_tool(&name, json!({})).await });
-
-    let first_response = first_task.await.unwrap();
-    assert_eq!(first_response["choices"][0]["finish_reason"], "tool_calls");
-    let tc1 = &first_response["choices"][0]["message"]["tool_calls"][0];
-
-    let mut msgs = messages.as_array().unwrap().clone();
-    msgs.push(first_response["choices"][0]["message"].clone());
-    msgs.push(json!({"role":"tool","content":first_return,"tool_call_id":tc1["id"]}));
-
-    let msgs_for_second = msgs.clone();
-    let p = proxy.clone();
-    let second_task = tokio::spawn(async move { p.openai_chat(json!({"messages":msgs_for_second})).await });
-
-    assert_eq!(first_tool_task.await.unwrap(), first_return);
-
-    // Second tool call
-    let p = proxy.clone();
-    let name = second_tool.to_string();
-    let second_tool_task = tokio::spawn(async move { p.mcp_call_tool(&name, json!({})).await });
-
-    let second_response = second_task.await.unwrap();
-    assert_eq!(second_response["choices"][0]["finish_reason"], "tool_calls");
-    let tc2 = &second_response["choices"][0]["message"]["tool_calls"][0];
-    assert_eq!(tc2["function"]["name"], second_tool);
-
-    // Build continuation with second tool result
-    let mut msgs3 = msgs.clone();
-    msgs3.push(second_response["choices"][0]["message"].clone());
-    msgs3.push(json!({"role":"tool","content":second_return,"tool_call_id":tc2["id"]}));
-
-    let p = proxy.clone();
-    let third_task = tokio::spawn(async move { p.openai_chat(json!({"messages":msgs3})).await });
-
-    assert_eq!(second_tool_task.await.unwrap(), second_return);
-
-    proxy.mcp_write_message(target).await;
-
-    let final_response = third_task.await.unwrap();
-    assert_eq!(final_response["choices"][0]["message"]["content"], target);
-    assert_eq!(final_response["choices"][0]["finish_reason"], "stop");
-}
-
-/// A request whose messages diverge from the prior conversation is a new conversation.
-pub async fn assert_diverging_history_is_new_conversation(
-    proxy: &TestProxy,
-    first_input: Value,
-    diverging_input: Value,
-) {
-    let p = proxy.clone();
-    tokio::spawn(async move { p.openai_chat(first_input).await });
-    let first_id = proxy.mcp_read_message().await["conversation_id"].clone();
-    proxy.mcp_write_message("reply").await;
-
-    let p = proxy.clone();
-    tokio::spawn(async move { p.openai_chat(diverging_input).await });
-    let second_id = proxy.mcp_read_message().await["conversation_id"].clone();
-    proxy.mcp_write_message("reply").await;
-
-    assert_ne!(first_id, second_id, "diverging history should start a new conversation");
-}
-
-/// Send `input` to the OpenAI endpoint. Agent reads it, replies with `target`.
-/// Asserts the caller receives `target` with finish_reason: stop.
+/// Agent reads `input`, replies with `target`. Asserts finish_reason: stop.
 pub async fn assert_text_reply(proxy: &TestProxy, input: Value, target: &str) {
     let p = proxy.clone();
     let openai_task = tokio::spawn(async move { p.openai_chat(input).await });
@@ -188,7 +110,7 @@ pub async fn assert_text_reply(proxy: &TestProxy, input: Value, target: &str) {
     assert_eq!(response["choices"][0]["finish_reason"], "stop");
 }
 
-/// Send `input`, yield for it to become active, assert MCP tools list equals `target`.
+/// Sends `input`, asserts MCP tools list equals `target` exactly.
 pub async fn assert_mcp_tool_list(proxy: &TestProxy, input: Value, target: &[&str]) {
     let p = proxy.clone();
     tokio::spawn(async move { p.openai_chat(input).await });
@@ -199,8 +121,19 @@ pub async fn assert_mcp_tool_list(proxy: &TestProxy, input: Value, target: &[&st
     proxy.mcp_write_message("done").await;
 }
 
-/// Full tool round-trip: agent calls `tool_name` → codebase sends `tool_return` →
-/// agent writes `target`. Asserts tool_calls response shape and final text response.
+/// Sends `input`, asserts the named tool's full definition in `tools/list` equals `target`.
+pub async fn assert_dynamic_tool_schema(proxy: &TestProxy, input: Value, tool_name: &str, target: Value) {
+    let p = proxy.clone();
+    tokio::spawn(async move { p.openai_chat(input).await });
+    sleep(Duration::from_millis(10)).await;
+
+    assert_eq!(proxy.mcp_get_tool_definition(tool_name).await, target);
+
+    proxy.mcp_write_message("done").await;
+}
+
+/// One tool round-trip: agent calls `tool_name`, codebase returns `tool_return`,
+/// agent writes `target`. Asserts tool_calls shape and final text response.
 pub async fn assert_tool_round_trip(
     proxy: &TestProxy,
     input: Value,
@@ -208,7 +141,7 @@ pub async fn assert_tool_round_trip(
     tool_return: &str,
     target: &str,
 ) {
-    let messages = input["messages"].clone();
+    let base = input["messages"].as_array().unwrap().clone();
     let p = proxy.clone();
     let first_task = tokio::spawn(async move { p.openai_chat(input).await });
 
@@ -221,26 +154,77 @@ pub async fn assert_tool_round_trip(
     let tool_call_response = first_task.await.unwrap();
     assert_eq!(tool_call_response["choices"][0]["finish_reason"], "tool_calls");
     assert_eq!(tool_call_response["choices"][0]["message"]["content"], Value::Null);
-    let tc = &tool_call_response["choices"][0]["message"]["tool_calls"][0];
-    assert_eq!(tc["function"]["name"], tool_name);
+    assert_eq!(tool_call_response["choices"][0]["message"]["tool_calls"][0]["function"]["name"], tool_name);
 
-    let mut msgs = messages.as_array().unwrap().clone();
-    msgs.push(tool_call_response["choices"][0]["message"].clone());
-    msgs.push(json!({"role":"tool","content":tool_return,"tool_call_id":tc["id"]}));
-
+    let continuation = with_tool_result(&base, &tool_call_response, tool_return);
     let p = proxy.clone();
-    let second_task = tokio::spawn(async move { p.openai_chat(json!({"messages":msgs})).await });
+    let final_task = tokio::spawn(async move { p.openai_chat(json!({"messages": continuation})).await });
 
     assert_eq!(tool_task.await.unwrap(), tool_return);
-
     proxy.mcp_write_message(target).await;
 
-    let final_response = second_task.await.unwrap();
+    let final_response = final_task.await.unwrap();
     assert_eq!(final_response["choices"][0]["message"]["content"], target);
     assert_eq!(final_response["choices"][0]["finish_reason"], "stop");
 }
 
-/// Send all `inputs` concurrently, assert agent sees them in arrival order.
+/// Two sequential tool calls in one turn, then agent writes `target`.
+pub async fn assert_two_tool_calls_in_one_turn(
+    proxy: &TestProxy,
+    input: Value,
+    first_tool: &str,
+    first_return: &str,
+    second_tool: &str,
+    second_return: &str,
+    target: &str,
+) {
+    let base = input["messages"].as_array().unwrap().clone();
+    let p = proxy.clone();
+    let first_task = tokio::spawn(async move { p.openai_chat(input).await });
+
+    proxy.mcp_read_message().await;
+
+    // agent calls first tool
+    let p = proxy.clone();
+    let name = first_tool.to_string();
+    let first_tool_task = tokio::spawn(async move { p.mcp_call_tool(&name, json!({})).await });
+
+    let first_response = first_task.await.unwrap();
+    assert_eq!(first_response["choices"][0]["finish_reason"], "tool_calls");
+    assert_eq!(first_response["choices"][0]["message"]["tool_calls"][0]["function"]["name"], first_tool);
+
+    // codebase sends first tool result
+    let after_first_tool = with_tool_result(&base, &first_response, first_return);
+    let p = proxy.clone();
+    let after = after_first_tool.clone();
+    let second_task = tokio::spawn(async move { p.openai_chat(json!({"messages": after})).await });
+
+    assert_eq!(first_tool_task.await.unwrap(), first_return);
+
+    // agent calls second tool
+    let p = proxy.clone();
+    let name = second_tool.to_string();
+    let second_tool_task = tokio::spawn(async move { p.mcp_call_tool(&name, json!({})).await });
+
+    let second_response = second_task.await.unwrap();
+    assert_eq!(second_response["choices"][0]["finish_reason"], "tool_calls");
+    assert_eq!(second_response["choices"][0]["message"]["tool_calls"][0]["function"]["name"], second_tool);
+
+    // codebase sends second tool result
+    let after_second_tool = with_tool_result(&after_first_tool, &second_response, second_return);
+    let p = proxy.clone();
+    let final_task = tokio::spawn(async move { p.openai_chat(json!({"messages": after_second_tool})).await });
+
+    assert_eq!(second_tool_task.await.unwrap(), second_return);
+
+    proxy.mcp_write_message(target).await;
+
+    let final_response = final_task.await.unwrap();
+    assert_eq!(final_response["choices"][0]["message"]["content"], target);
+    assert_eq!(final_response["choices"][0]["finish_reason"], "stop");
+}
+
+/// Sends all `inputs` concurrently, asserts agent sees them in arrival order.
 pub async fn assert_fifo_order(proxy: &TestProxy, inputs: Vec<Value>) {
     let expected: Vec<String> = inputs
         .iter()
@@ -259,7 +243,7 @@ pub async fn assert_fifo_order(proxy: &TestProxy, inputs: Vec<Value>) {
     }
 }
 
-/// After a tool round-trip, assert read_message returns only `expected_delta`
+/// After a tool round-trip, asserts read_message returns only `expected_delta`
 /// and conversation_id is unchanged.
 pub async fn assert_delta_on_continuation(
     proxy: &TestProxy,
@@ -268,9 +252,9 @@ pub async fn assert_delta_on_continuation(
     tool_return: &str,
     expected_delta: Value,
 ) {
-    let messages = input["messages"].clone();
+    let base = input["messages"].as_array().unwrap().clone();
     let p = proxy.clone();
-    let first_task = tokio::spawn(async move { p.openai_chat(input).await });
+    let openai_task = tokio::spawn(async move { p.openai_chat(input).await });
 
     let first_read = proxy.mcp_read_message().await;
     let conversation_id = first_read["conversation_id"].clone();
@@ -279,16 +263,13 @@ pub async fn assert_delta_on_continuation(
     let name = tool_name.to_string();
     let tool_task = tokio::spawn(async move { p.mcp_call_tool(&name, json!({})).await });
 
-    let tool_call_response = first_task.await.unwrap();
-    let tc = &tool_call_response["choices"][0]["message"]["tool_calls"][0];
-
-    let mut msgs = messages.as_array().unwrap().clone();
-    msgs.push(tool_call_response["choices"][0]["message"].clone());
-    msgs.push(json!({"role":"tool","content":tool_return,"tool_call_id":tc["id"]}));
+    let tool_call_response = openai_task.await.unwrap();
+    let continuation = with_tool_result(&base, &tool_call_response, tool_return);
 
     let p = proxy.clone();
-    tokio::spawn(async move { p.openai_chat(json!({"messages":msgs})).await });
-    tool_task.await.unwrap();
+    tokio::spawn(async move { p.openai_chat(json!({"messages": continuation})).await });
+
+    assert_eq!(tool_task.await.unwrap(), tool_return);
 
     let delta = proxy.mcp_read_message().await;
     assert_eq!(delta["conversation_id"], conversation_id, "conversation_id changed on continuation");
@@ -298,25 +279,26 @@ pub async fn assert_delta_on_continuation(
 }
 
 /// Two independent requests get different conversation_ids.
-pub async fn assert_different_conversation_ids(
-    proxy: &TestProxy,
-    first_input: Value,
-    second_input: Value,
-) {
+pub async fn assert_different_conversation_ids(proxy: &TestProxy, first: Value, second: Value) {
     let p = proxy.clone();
-    tokio::spawn(async move { p.openai_chat(first_input).await });
+    tokio::spawn(async move { p.openai_chat(first).await });
     let first_id = proxy.mcp_read_message().await["conversation_id"].clone();
     proxy.mcp_write_message("reply").await;
 
     let p = proxy.clone();
-    tokio::spawn(async move { p.openai_chat(second_input).await });
+    tokio::spawn(async move { p.openai_chat(second).await });
     let second_id = proxy.mcp_read_message().await["conversation_id"].clone();
     proxy.mcp_write_message("reply").await;
 
     assert_ne!(first_id, second_id);
 }
 
-/// After turn 1 completes, turn 2 exposes only `expected_tools` — no leakage.
+/// A request with a diverging message history is treated as a new conversation.
+pub async fn assert_diverging_history_is_new_conversation(proxy: &TestProxy, first: Value, diverging: Value) {
+    assert_different_conversation_ids(proxy, first, diverging).await;
+}
+
+/// After turn 1 completes, turn 2 exposes only `expected_tools` — no state leakage.
 pub async fn assert_no_state_leakage(
     proxy: &TestProxy,
     first_input: Value,
