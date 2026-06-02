@@ -1,197 +1,39 @@
-use std::{
-    collections::VecDeque,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
-};
-use axum::{extract::State, routing::post, Json, Router};
 use reqwest::Client;
 use serde_json::{json, Value};
-use tokio::sync::{oneshot, Mutex, Notify};
+use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
-
-// ── Fake proxy server ──────────────────────────────────────────────────────
-
-static CONV_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn new_conv_id() -> String {
-    format!("conv-{}", CONV_COUNTER.fetch_add(1, Ordering::Relaxed))
-}
-
-struct QueuedRequest {
-    conversation_id: String,
-    messages: Value,
-    tools: Vec<Value>,
-    reply_tx: oneshot::Sender<Value>,
-}
-
-struct FakeState {
-    queue:        Mutex<VecDeque<QueuedRequest>>,
-    active_tools: Mutex<Vec<Value>>,
-    active_conv:  Mutex<String>,
-    reply_tx:     Mutex<Option<oneshot::Sender<Value>>>,
-    tool_result:  Mutex<Option<oneshot::Sender<String>>>,
-    // delta cached from a tool-result continuation for the next read_message call
-    delta_cache:  Mutex<Option<(String, Value)>>,
-    notify:       Notify,
-}
-
-impl FakeState {
-    fn new() -> Self {
-        Self {
-            queue:        Mutex::new(VecDeque::new()),
-            active_tools: Mutex::new(vec![]),
-            active_conv:  Mutex::new(String::new()),
-            reply_tx:     Mutex::new(None),
-            tool_result:  Mutex::new(None),
-            delta_cache:  Mutex::new(None),
-            notify:       Notify::new(),
-        }
-    }
-}
-
-async fn openai_handler(State(s): State<Arc<FakeState>>, Json(body): Json<Value>) -> Json<Value> {
-    let (reply_tx, reply_rx) = oneshot::channel::<Value>();
-    let tool_result_tx = s.tool_result.lock().await.take();
-
-    if let Some(tx) = tool_result_tx {
-        // continuation: codebase is returning a tool result
-        let last    = body["messages"].as_array().unwrap().last().unwrap().clone();
-        let conv_id = s.active_conv.lock().await.clone();
-        tx.send(last["content"].as_str().unwrap_or("").to_string()).ok();
-        // pre-set reply_tx so the agent can make another tool call without read_message
-        *s.reply_tx.lock().await    = Some(reply_tx);
-        // cache the delta so read_message can return it if called
-        *s.delta_cache.lock().await = Some((conv_id, json!([last])));
-    } else {
-        // new conversation
-        let tools: Vec<Value> = body["tools"].as_array().cloned().unwrap_or_default();
-        s.queue.lock().await.push_back(QueuedRequest {
-            conversation_id: new_conv_id(),
-            messages: body["messages"].clone(),
-            tools,
-            reply_tx,
-        });
-    }
-
-    s.notify.notify_one();
-    Json(reply_rx.await.unwrap_or_else(|_| json!({})))
-}
-
-async fn mcp_handler(State(s): State<Arc<FakeState>>, Json(body): Json<Value>) -> Json<Value> {
-    let method = body["method"].as_str().unwrap_or("");
-    let params = &body["params"];
-    let result = match method {
-        "tools/list" => mcp_list(&s).await,
-        "tools/call" => match params["name"].as_str().unwrap_or("") {
-            "read_message" => mcp_read(&s).await,
-            "write_message" => mcp_write(&s, params["arguments"]["content"].as_str().unwrap_or("")).await,
-            tool => mcp_tool(&s, tool).await,
-        },
-        _ => json!(null),
-    };
-    Json(json!({ "jsonrpc": "2.0", "id": body["id"], "result": result }))
-}
-
-async fn mcp_list(s: &FakeState) -> Value {
-    let dynamic = {
-        let active = s.active_tools.lock().await.clone();
-        if !active.is_empty() {
-            active
-        } else {
-            s.queue.lock().await.front().map(|r| r.tools.clone()).unwrap_or_default()
-        }
-    };
-    let mut tools = vec![
-        json!({"name":"read_message",  "description":"Read pending message", "input_schema":{}}),
-        json!({"name":"write_message", "description":"Write a response",     "input_schema":{"type":"object","properties":{"content":{"type":"string"}}}}),
-    ];
-    for t in &dynamic {
-        let f = &t["function"];
-        tools.push(json!({"name": f["name"], "description": f["description"], "input_schema": f["parameters"]}));
-    }
-    json!({ "tools": tools })
-}
-
-async fn mcp_read(s: &FakeState) -> Value {
-    // check delta cache first (populated after a tool-result continuation)
-    if let Some((conv_id, messages)) = s.delta_cache.lock().await.take() {
-        *s.active_conv.lock().await = conv_id.clone();
-        let payload = json!({ "conversation_id": conv_id, "messages": messages });
-        return json!({"content": [{"type":"text","text": payload.to_string()}]});
-    }
-    // otherwise wait for a new request in the queue
-    loop {
-        let req = s.queue.lock().await.pop_front();
-        if let Some(req) = req {
-            *s.active_tools.lock().await = req.tools;
-            *s.active_conv.lock().await  = req.conversation_id.clone();
-            *s.reply_tx.lock().await     = Some(req.reply_tx);
-            let payload = json!({ "conversation_id": req.conversation_id, "messages": req.messages });
-            return json!({"content": [{"type":"text","text": payload.to_string()}]});
-        }
-        s.notify.notified().await;
-    }
-}
-
-async fn mcp_write(s: &FakeState, content: &str) -> Value {
-    if let Some(tx) = s.reply_tx.lock().await.take() {
-        tx.send(json!({"choices":[{"message":{"role":"assistant","content":content},"finish_reason":"stop"}]})).ok();
-    }
-    *s.active_tools.lock().await = vec![];
-    s.notify.notify_one();
-    text("ok")
-}
-
-async fn mcp_tool(s: &FakeState, tool_name: &str) -> Value {
-    let (result_tx, result_rx) = oneshot::channel::<String>();
-    *s.tool_result.lock().await = Some(result_tx);
-    if let Some(tx) = s.reply_tx.lock().await.take() {
-        tx.send(json!({"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call-1","type":"function","function":{"name":tool_name,"arguments":"{}"}}]},"finish_reason":"tool_calls"}]})).ok();
-    }
-    let result = result_rx.await.unwrap_or_default();
-    text(&result)
-}
-
-fn text(s: &str) -> Value {
-    json!({ "content": [{ "type": "text", "text": s }] })
-}
 
 // ── TestProxy ──────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 pub struct TestProxy {
     pub openai_url: String,
-    pub mcp_url: String,
-    client: Client,
+    pub mcp_url:    String,
+    client:         Client,
 }
 
 impl TestProxy {
     pub async fn start() -> Self {
-        let state = Arc::new(FakeState::new());
-
-        let openai_app = Router::new().route("/v1/chat/completions", post(openai_handler)).with_state(state.clone());
-        let mcp_app    = Router::new().route("/mcp", post(mcp_handler)).with_state(state.clone());
-
-        let openai_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mcp_listener    = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let openai_port = openai_listener.local_addr().unwrap().port();
-        let mcp_port    = mcp_listener.local_addr().unwrap().port();
-
-        tokio::spawn(async move { axum::serve(openai_listener, openai_app).await.unwrap() });
-        tokio::spawn(async move { axum::serve(mcp_listener,    mcp_app).await.unwrap() });
-
-        TestProxy {
-            openai_url: format!("http://127.0.0.1:{openai_port}"),
-            mcp_url:    format!("http://127.0.0.1:{mcp_port}"),
-            client: Client::new(),
-        }
+        let port = free_port();
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move { reverse_proxy::start(port).await.unwrap() });
+        });
+        let url = format!("http://127.0.0.1:{port}");
+        wait_ready(&url).await;
+        Self { openai_url: url.clone(), mcp_url: url, client: Client::new() }
     }
 
     pub async fn openai_chat(&self, body: Value) -> Value {
-        self.client.post(format!("{}/v1/chat/completions", self.openai_url))
-            .json(&body).send().await.unwrap().json().await.unwrap()
+        self.client
+            .post(format!("{}/v1/chat/completions", self.openai_url))
+            .json(&body)
+            .send().await.unwrap()
+            .json().await.unwrap()
     }
 
     pub async fn mcp_list_tools(&self) -> Vec<String> {
@@ -220,21 +62,65 @@ impl TestProxy {
         result["content"][0]["text"].as_str().unwrap().to_string()
     }
 
-    pub async fn mcp_subscribe_notifications(&self) -> tokio::sync::mpsc::Receiver<String> {
-        todo!("subscribe to MCP SSE notification stream")
+    pub async fn mcp_subscribe_notifications(&self) -> mpsc::Receiver<String> {
+        let (tx, rx) = mpsc::channel(16);
+        let url    = format!("{}/mcp", self.mcp_url);
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            let resp = client.get(&url).send().await.unwrap();
+            let mut stream = resp.bytes_stream();
+            let mut buf = String::new();
+            while let Some(Ok(chunk)) = stream.next().await {
+                buf.push_str(&String::from_utf8_lossy(&chunk));
+                while let Some(pos) = buf.find('\n') {
+                    let line = buf[..pos].trim_end_matches('\r').to_string();
+                    buf.drain(..=pos);
+                    if let Some(data) = line.strip_prefix("data: ") {
+                        if data.is_empty() { continue; }
+                        if let Ok(v) = serde_json::from_str::<Value>(data) {
+                            if let Some(method) = v["method"].as_str() {
+                                let _ = tx.send(method.to_string()).await;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        rx
     }
 
     async fn mcp_call(&self, method: &str, params: Value) -> Value {
         let body: Value = self.client.post(format!("{}/mcp", self.mcp_url))
             .json(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
-            .send().await.unwrap().json().await.unwrap();
+            .send().await.unwrap()
+            .json().await.unwrap();
         body["result"].clone()
     }
 }
 
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0").unwrap()
+        .local_addr().unwrap().port()
+}
+
+async fn wait_ready(url: &str) {
+    let client = Client::new();
+    for _ in 0..100 {
+        let ok = client.post(format!("{url}/mcp"))
+            .json(&json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}))
+            .send().await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false);
+        if ok { return; }
+        sleep(Duration::from_millis(20)).await;
+    }
+    panic!("proxy did not become ready");
+}
+
 // ── Shared utility ─────────────────────────────────────────────────────────
 
-fn with_tool_result(history: &[Value], tool_call_response: &Value, tool_return: &str) -> Vec<Value> {
+pub fn with_tool_result(history: &[Value], tool_call_response: &Value, tool_return: &str) -> Vec<Value> {
     let tc = &tool_call_response["choices"][0]["message"]["tool_calls"][0];
     let mut next = history.to_vec();
     next.push(tool_call_response["choices"][0]["message"].clone());
@@ -390,15 +276,13 @@ pub async fn assert_delta_on_continuation(
 
     let delta = proxy.mcp_read_message().await;
     assert_eq!(delta["conversation_id"], conversation_id, "conversation_id changed on continuation");
-    let actual_msgs   = delta["messages"].as_array().unwrap();
-    let expected_msgs = expected_delta.as_array().unwrap();
-    assert_eq!(actual_msgs.len(), expected_msgs.len(), "delta message count mismatch");
-    // compare role and content, not tool_call_id (implementation detail)
-    for (actual, expected) in actual_msgs.iter().zip(expected_msgs) {
-        assert_eq!(actual["role"],    expected["role"]);
-        assert_eq!(actual["content"], expected["content"]);
+    let actual   = delta["messages"].as_array().unwrap();
+    let expected = expected_delta.as_array().unwrap();
+    assert_eq!(actual.len(), expected.len(), "delta message count mismatch");
+    for (a, e) in actual.iter().zip(expected) {
+        assert_eq!(a["role"],    e["role"]);
+        assert_eq!(a["content"], e["content"]);
     }
-
     proxy.mcp_write_message("done").await;
 }
 
@@ -420,7 +304,6 @@ pub async fn assert_different_conversation_ids(proxy: &TestProxy, first: Value, 
 /// Asserts the agent sees only the diverging request's own messages — not a continuation of first.
 pub async fn assert_diverging_history_is_new_conversation(proxy: &TestProxy, first: Value, diverging: Value) {
     let diverging_messages = diverging["messages"].clone();
-
     let p = proxy.clone();
     tokio::spawn(async move { p.openai_chat(first).await });
     proxy.mcp_read_message().await;
@@ -456,7 +339,6 @@ pub async fn assert_no_state_leakage(
 
 pub async fn assert_concurrent_ingestion(proxy: &TestProxy, count: usize) {
     assert!(count >= 2, "need at least 2 requests to test concurrent ingestion");
-
     let handles: Vec<_> = (0..count).map(|i| {
         let p = proxy.clone();
         tokio::spawn(async move {
@@ -464,19 +346,13 @@ pub async fn assert_concurrent_ingestion(proxy: &TestProxy, count: usize) {
         })
     }).collect();
 
-    // Start serving the first request. While it is in progress (before write_message),
-    // yield to let the other requests reach the server — if ingestion were sequential
-    // they would be blocked and the queue size would be 0.
     proxy.mcp_read_message().await;
     sleep(Duration::from_millis(10)).await;
-
-    // All remaining requests must already be queued (accepted at the HTTP layer).
-    // We verify by reading them all without any new spawns.
     proxy.mcp_write_message("reply").await;
+
     for _ in 1..count {
         proxy.mcp_read_message().await;
         proxy.mcp_write_message("reply").await;
     }
-
     for h in handles { h.await.unwrap(); }
 }

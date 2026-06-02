@@ -201,9 +201,8 @@ async fn server_accepts_new_requests_while_turn_is_in_progress() {
     assert_concurrent_ingestion(&proxy, concurrent_request_count).await;
 }
 
-// ── mcp/RULES.md:2 — requires SSE transport (ignored until implemented) ───
+// ── mcp/RULES.md:2 ────────────────────────────────────────────────────────
 
-#[ignore]
 #[tokio::test]
 async fn tools_list_changed_fires_on_new_conversation_not_on_continuation() {
     let proxy = TestProxy::start().await;
@@ -264,7 +263,7 @@ async fn dynamic_tool_schema_mirrors_openai_function_definition() {
     let target    = json!({
         "name": "get_weather",
         "description": "Get current weather for a location",
-        "input_schema": {
+        "inputSchema": {
             "type": "object",
             "properties": { "location": { "type": "string" } },
             "required": ["location"]
